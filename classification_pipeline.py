@@ -16,7 +16,8 @@ from transformers import (
 from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
-from imblearn.over_sampling import SMOTE
+from sklearn.utils.class_weight import compute_sample_weight
+#from imblearn.over_sampling import SMOTE
 import xgboost as xgb
 import data_prep
 
@@ -24,7 +25,7 @@ import data_prep
 MODE = "EVAL" # "EVAL" for local validation, "SUBMIT" for leaderboard
 LORA_MODEL_NAME = "microsoft/deberta-v3-large"
 ZS_MODEL_NAME = "microsoft/deberta-v2-xlarge-mnli"
-LORA_EPOCHS = 15
+LORA_EPOCHS = 30
 LORA_BATCH_SIZE = 16
 
 LABEL_MAP = {"SUPPORTS": 0, "REFUTES": 1, "NOT_ENOUGH_INFO": 2, "DISPUTED": 3}
@@ -91,7 +92,12 @@ def extract_zs_features(df, zs_pipe, cache_path=None):
 def tokenize_function(examples, tokenizer):
     return tokenizer(examples["text_input"], truncation=True, max_length=512)
 
-def train_lora_model(df_train, tokenizer):
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return {"accuracy": accuracy_score(labels, predictions)}
+
+def train_lora_model(df_train, df_eval, tokenizer):
     print("Initializing QLoRA Model (4-bit)...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -125,6 +131,10 @@ def train_lora_model(df_train, tokenizer):
     train_dataset = train_dataset.rename_column("label_id", "label")
     tokenized_train = train_dataset.map(lambda x: tokenize_function(x, tokenizer), batched=True)
     
+    eval_dataset = Dataset.from_pandas(df_eval[['text_input', 'label_id']].dropna())
+    eval_dataset = eval_dataset.rename_column("label_id", "label")
+    tokenized_eval = eval_dataset.map(lambda x: tokenize_function(x, tokenizer), batched=True)
+    
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     
     training_args = TrainingArguments(
@@ -134,7 +144,10 @@ def train_lora_model(df_train, tokenizer):
         num_train_epochs=LORA_EPOCHS,
         weight_decay=0.01,
         logging_steps=10,
+        evaluation_strategy="epoch",
         save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy",
         disable_tqdm=False, # Ensure Trainer progress bar is visible
         report_to="none",
         fp16=True,
@@ -146,6 +159,8 @@ def train_lora_model(df_train, tokenizer):
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        compute_metrics=compute_metrics,
         data_collator=data_collator,
     )
     
@@ -208,7 +223,7 @@ def main():
     
     # 2. LoRA Model Training & Features
     tokenizer = AutoTokenizer.from_pretrained(LORA_MODEL_NAME)
-    trainer, lora_model = train_lora_model(df_train_final, tokenizer)
+    trainer, lora_model = train_lora_model(df_train_final, df_eval_final, tokenizer)
     
     lora_features_train = get_lora_probs(df_train_final, trainer, tokenizer)
     lora_features_eval = get_lora_probs(df_eval_final, trainer, tokenizer)
@@ -217,15 +232,11 @@ def main():
     print("Training XGBoost Meta-Classifier...")
     X_train = np.hstack([lora_features_train, zs_features_train])
     y_train = df_train_final['label_id'].values
-    
+
     X_eval = np.hstack([lora_features_eval, zs_features_eval])
-    
-    print(f"Original training shape: {X_train.shape}")
-    print("Applying SMOTE to balance classes...")
-    smote = SMOTE(random_state=42)
-    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
-    print(f"Resampled training shape: {X_train_resampled.shape}")
-    
+    print("Calculate Sample Weights to handle class imbalance...")
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+
     xgb_model = xgb.XGBClassifier(
         n_estimators=100,
         max_depth=4,
@@ -234,9 +245,10 @@ def main():
         num_class=4,
         random_state=42
     )
-    
-    xgb_model.fit(X_train_resampled, y_train_resampled)
-    
+
+    # Input the real sample features and their corresponding weights
+    xgb_model.fit(X_train, y_train, sample_weight=sample_weights)
+
     print("Predicting probabilities with XGBoost...")
     y_eval_probs = xgb_model.predict_proba(X_eval)
     

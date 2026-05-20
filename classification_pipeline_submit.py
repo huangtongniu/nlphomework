@@ -16,6 +16,7 @@ from transformers import (
 from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from sklearn.utils.class_weight import compute_sample_weight
 from imblearn.over_sampling import SMOTE
 import xgboost as xgb
 import data_prep
@@ -24,7 +25,7 @@ import data_prep
 MODE = "SUBMIT" # "EVAL" for local validation, "SUBMIT" for leaderboard
 LORA_MODEL_NAME = "microsoft/deberta-v3-large"
 ZS_MODEL_NAME = "microsoft/deberta-v2-xlarge-mnli"
-LORA_EPOCHS = 15
+LORA_EPOCHS = 30
 LORA_BATCH_SIZE = 16
 
 LABEL_MAP = {"SUPPORTS": 0, "REFUTES": 1, "NOT_ENOUGH_INFO": 2, "DISPUTED": 3}
@@ -219,12 +220,8 @@ def main():
     y_train = df_train_final['label_id'].values
     
     X_eval = np.hstack([lora_features_eval, zs_features_eval])
-    
-    print(f"Original training shape: {X_train.shape}")
-    print("Applying SMOTE to balance classes...")
-    smote = SMOTE(random_state=42)
-    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
-    print(f"Resampled training shape: {X_train_resampled.shape}")
+    print("Calculate Sample Weights to handle class imbalance...")
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
     
     xgb_model = xgb.XGBClassifier(
         n_estimators=100,
@@ -235,7 +232,8 @@ def main():
         random_state=42
     )
     
-    xgb_model.fit(X_train_resampled, y_train_resampled)
+    # Input the real sample features and their corresponding weights
+    xgb_model.fit(X_train, y_train, sample_weight=sample_weights)
     
     print("Predicting probabilities with XGBoost...")
     y_eval_probs = xgb_model.predict_proba(X_eval)
@@ -298,9 +296,9 @@ def main():
         print("EVAL Output saved to dev-predictions.json")
         
     else:
-        # Apply optimal class weights found during local validation (EVAL mode)
-        best_weights = np.array([0.889, 1.812, 1.147, 0.366])
-        final_preds = np.argmax(y_eval_probs * best_weights, axis=1)
+        # Since we use balanced sample_weights during XGBoost training, 
+        # probabilities are naturally balanced and we can take direct argmax.
+        final_preds = np.argmax(y_eval_probs, axis=1)
         
         output = {}
         with open("processed_data/test_retrieved.json", "r", encoding="utf-8") as f:
