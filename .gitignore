@@ -1,0 +1,37 @@
+# Python 环境与缓存
+venv/
+.env
+__pycache__/
+*.py[cod]
+
+# 数据与数据集
+data/
+processed_data/
+data/evidence.json
+*-predictions.json
+*-output.json
+test-output.zip
+*.gz
+*.npy
+
+# 模型、索引与大型二进制文件 (NLP 核心忽略)
+evidence_hnsw.bin
+ bge_index.bin
+*.pt
+*.bin
+*.pth
+*.onnx
+models/
+weights/
+/cross_encoder_model*
+evidence_hnsw.bin
+
+# IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
+*.log
+.ipynb_checkpoints/
+
+# 个人笔记
+fuben.md

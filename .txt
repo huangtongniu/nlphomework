@@ -1,0 +1,34 @@
+# 进入你的项目目录后执行
+cat <<EOF > .gitignore
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# 深度学习模型与索引 (针对你的项目)
+*.pt
+*.bin
+*.pth
+*.onnx
+model/
+weights/
+
+# 数据集与处理结果 (防止上传过大的 JSON)
+data/
+processed_data/
+*-predictions.json
+*-output.json
+test-output.zip
+
+# 编辑器与系统文件
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+# 个人笔记/备份
+fuben.md
+EOF
