@@ -9,16 +9,21 @@ import scipy.sparse as sp
 from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import CountVectorizer
 from sentence_transformers import SentenceTransformer, CrossEncoder, InputExample
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 from torch.utils.data import DataLoader
 from nltk.tokenize import wordpunct_tokenize
 import data_prep
 
 # Configuration
-K_BM25 = 600
+K_SPLADE = 600
 N_DENSE = 600
 TOP_COARSE = 200
 TOP_FINE = 5
 BGE_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+SPLADE_MODEL_NAME = "naver/splade-cocondenser-ensembledistil"
+SPLADE_BATCH_SIZE = 32
+SPLADE_MAX_LENGTH = 128
+SPLADE_TOP_TERMS = 128
 CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L12-v2"
 CE_TRAIN_EPOCHS = 2
 CE_BATCH_SIZE = 16
@@ -73,10 +78,101 @@ def build_or_load_bm25(corpus_texts, corpus_ids, cache_path="fast_bm25_index.pkl
         pickle.dump(bm25, f)
     return bm25
 
+def splade_cache_name(model_name):
+    return model_name.replace("/", "__").replace("-", "_").replace(".", "_")
+
+def prune_splade_weights(weights, top_terms):
+    if top_terms is None or top_terms >= weights.shape[1]:
+        return weights
+
+    top_values, top_indices = torch.topk(weights, k=top_terms, dim=1)
+    pruned = torch.zeros_like(weights)
+    pruned.scatter_(1, top_indices, top_values)
+    return pruned
+
+def encode_splade_texts(texts, tokenizer, model, device, batch_size, desc):
+    rows = []
+
+    for start in tqdm(range(0, len(texts), batch_size), desc=desc):
+        batch = texts[start:start + batch_size]
+        tokens = tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=SPLADE_MAX_LENGTH,
+            return_tensors="pt",
+        )
+        tokens = {key: value.to(device) for key, value in tokens.items()}
+
+        with torch.no_grad():
+            logits = model(**tokens).logits
+            attention_mask = tokens["attention_mask"].unsqueeze(-1)
+            weights = torch.log1p(torch.relu(logits))
+            weights = (weights * attention_mask).max(dim=1).values
+            weights = prune_splade_weights(weights, SPLADE_TOP_TERMS)
+
+        rows.append(sp.csr_matrix(weights.cpu().numpy()))
+        del logits, weights, tokens
+
+    return sp.vstack(rows, format="csr")
+
+class FastSplade:
+    def __init__(self, corpus_index, tokenizer, model, device):
+        self.corpus_index = corpus_index
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device
+
+    def get_top_k(self, queries, k=600):
+        query_index = encode_splade_texts(
+            queries,
+            self.tokenizer,
+            self.model,
+            self.device,
+            SPLADE_BATCH_SIZE,
+            "Encoding SPLADE Queries",
+        )
+
+        results = []
+        for row_idx in tqdm(range(query_index.shape[0]), desc="SPLADE Scoring"):
+            scores = query_index[row_idx].dot(self.corpus_index.T).toarray().ravel()
+            if scores.size <= k:
+                top_idx = np.argsort(scores)[::-1]
+            else:
+                top_idx = np.argpartition(scores, -k)[-k:]
+                top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+            results.append(top_idx)
+        return results
+
+def build_or_load_splade(corpus_texts, cache_path=None):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading SPLADE model on {device}...")
+    tokenizer = AutoTokenizer.from_pretrained(SPLADE_MODEL_NAME)
+    model = AutoModelForMaskedLM.from_pretrained(SPLADE_MODEL_NAME).to(device)
+    model.eval()
+
+    if cache_path and os.path.exists(cache_path):
+        print("Loading SPLADE corpus index from cache...")
+        corpus_index = sp.load_npz(cache_path).tocsr()
+    else:
+        print("Encoding SPLADE corpus index...")
+        corpus_index = encode_splade_texts(
+            corpus_texts,
+            tokenizer,
+            model,
+            device,
+            SPLADE_BATCH_SIZE,
+            "Encoding SPLADE Corpus",
+        )
+        if cache_path:
+            sp.save_npz(cache_path, corpus_index, compressed=True)
+
+    return FastSplade(corpus_index, tokenizer, model, device)
+
 def build_or_load_dense_embs(corpus_texts, model, cache_path="bge_corpus_embs.pt"):
     if os.path.exists(cache_path):
         print("Loading dense embeddings from cache...")
-        return torch.load(cache_path)
+        return torch.load(cache_path, weights_only=True)
 
     print("Encoding Dense Corpus directly to PyTorch tensors...")
     batch_size = 2048 
@@ -91,7 +187,7 @@ def build_or_load_dense_embs(corpus_texts, model, cache_path="bge_corpus_embs.pt
     torch.save(final_tensor, cache_path)
     return final_tensor
 
-def coarse_retrieval(df, bm25, corpus_embs, dense_model, corpus_ids, desc="Coarse", cache_path=None):
+def coarse_retrieval(df, splade, corpus_embs, dense_model, corpus_ids, desc="Coarse", cache_path=None):
     if cache_path and os.path.exists(cache_path):
         print(f"Loading cached coarse retrieval for {desc}...")
         with open(cache_path, "r", encoding="utf-8") as f:
@@ -119,18 +215,18 @@ def coarse_retrieval(df, bm25, corpus_embs, dense_model, corpus_ids, desc="Coars
     del corpus_embs_gpu
     torch.cuda.empty_cache()
     
-    # Fast BM25 Search
-    print(f"Performing BM25 Exact Search...")
+    # SPLADE learned sparse retrieval
+    print(f"Performing SPLADE Search...")
     queries_text = df["claim_text"].tolist()
-    bm25_top_indices_list = bm25.get_top_k(queries_text, k=K_BM25)
+    splade_top_indices_list = splade.get_top_k(queries_text, k=K_SPLADE)
     
-    print(f"Merging BM25 & Dense for {desc}...")
+    print(f"Merging SPLADE & Dense for {desc}...")
     for i, row in tqdm(df.iterrows(), total=len(df), desc="Merging"):
         claim_id = row["claim_id"]
         
-        # BM25
-        bm25_top_idx = bm25_top_indices_list[i]
-        bm25_top_ids = [corpus_ids[idx] for idx in bm25_top_idx]
+        # SPLADE
+        splade_top_idx = splade_top_indices_list[i]
+        splade_top_ids = [corpus_ids[idx] for idx in splade_top_idx]
         
         # Dense
         dense_top_ids = [corpus_ids[idx] for idx in dense_labels[i]]
@@ -138,10 +234,10 @@ def coarse_retrieval(df, bm25, corpus_embs, dense_model, corpus_ids, desc="Coars
         # Interleave / Merge while preserving order
         merged = []
         seen = set()
-        for b_id, d_id in zip(bm25_top_ids, dense_top_ids):
-            if b_id not in seen:
-                merged.append(b_id)
-                seen.add(b_id)
+        for s_id, d_id in zip(splade_top_ids, dense_top_ids):
+            if s_id not in seen:
+                merged.append(s_id)
+                seen.add(s_id)
             if d_id not in seen:
                 merged.append(d_id)
                 seen.add(d_id)
@@ -210,8 +306,9 @@ def main():
     corpus_ids = df_evid["evid_id"].tolist()
     corpus_texts = df_evid["evid_text"].tolist()
     
-    # 1. BM25
-    bm25 = build_or_load_bm25(corpus_texts, corpus_ids)
+    # 1. SPLADE learned sparse retrieval
+    splade_cache_path = f"{splade_cache_name(SPLADE_MODEL_NAME)}_top{SPLADE_TOP_TERMS}_index.npz"
+    splade = build_or_load_splade(corpus_texts, splade_cache_path)
     
     # 2. Dense (BGE) via Fast Exact GPU Search
     print("Loading BGE model...")
@@ -222,13 +319,13 @@ def main():
     os.makedirs("./processed_data", exist_ok=True)
     
     # 3. Coarse Retrieval
-    coarse_train = coarse_retrieval(df_train, bm25, corpus_embs, dense_model, corpus_ids, "Train", "./processed_data/coarse_train.json")
-    coarse_dev = coarse_retrieval(df_dev, bm25, corpus_embs, dense_model, corpus_ids, "Dev", "./processed_data/coarse_dev.json")
-    coarse_test = coarse_retrieval(df_test, bm25, corpus_embs, dense_model, corpus_ids, "Test", "./processed_data/coarse_test.json")
+    coarse_train = coarse_retrieval(df_train, splade, corpus_embs, dense_model, corpus_ids, "Train", "./processed_data/coarse_train_splade.json")
+    coarse_dev = coarse_retrieval(df_dev, splade, corpus_embs, dense_model, corpus_ids, "Dev", "./processed_data/coarse_dev_splade.json")
+    coarse_test = coarse_retrieval(df_test, splade, corpus_embs, dense_model, corpus_ids, "Test", "./processed_data/coarse_test_splade.json")
     
     # 4. CrossEncoder Training (STRICTLY ON TRAIN ONLY)
-    ce_model_path = "./models/ce_trained"
-    if os.path.exists(ce_model_path):
+    ce_model_path = "./models/ce_trained_splade"
+    if os.path.exists(ce_model_path) and os.path.exists(os.path.join(ce_model_path, "config.json")):
         print(f"Loading trained CrossEncoder from {ce_model_path}...")
         ce_model = CrossEncoder(ce_model_path)
     else:

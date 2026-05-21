@@ -25,7 +25,7 @@ import data_prep
 MODE = "EVAL" # "EVAL" for local validation, "SUBMIT" for leaderboard
 LORA_MODEL_NAME = "microsoft/deberta-v3-large"
 ZS_MODEL_NAME = "microsoft/deberta-v2-xlarge-mnli"
-LORA_EPOCHS = 30
+LORA_EPOCHS = 10
 LORA_BATCH_SIZE = 16
 
 LABEL_MAP = {"SUPPORTS": 0, "REFUTES": 1, "NOT_ENOUGH_INFO": 2, "DISPUTED": 3}
