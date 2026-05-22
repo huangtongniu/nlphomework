@@ -18,7 +18,12 @@ import data_prep
 K_SPLADE = 600
 N_DENSE = 600
 TOP_COARSE = 200
-TOP_FINE = 5
+RERANK_CANDIDATE_K = 10
+EVIDENCE_SELECTION_MODE = "relative_gap"  # "fixed", "absolute", or "relative_gap"
+FIXED_OUTPUT_K = 4
+DYNAMIC_MAX_K = 5
+DYNAMIC_SCORE_THRESHOLD = 0.5
+DYNAMIC_SCORE_GAP = 0.60
 BGE_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 SPLADE_MODEL_NAME = "naver/splade-cocondenser-ensembledistil"
 SPLADE_BATCH_SIZE = 32
@@ -268,6 +273,37 @@ def prepare_ce_training_data(df_train, coarse_train_dict, evid_dict):
             
     return train_samples
 
+def select_evidences(
+    candidate_evidences,
+    candidate_scores,
+    mode=EVIDENCE_SELECTION_MODE,
+    fixed_k=FIXED_OUTPUT_K,
+    max_k=DYNAMIC_MAX_K,
+    threshold=DYNAMIC_SCORE_THRESHOLD,
+    gap=DYNAMIC_SCORE_GAP,
+):
+    aligned = list(zip(candidate_evidences, candidate_scores))
+    if not aligned:
+        return [], []
+
+    if mode == "fixed":
+        selected = aligned[:max(1, fixed_k)]
+    elif mode == "absolute":
+        selected = [(evid_id, score) for evid_id, score in aligned if score >= threshold]
+        selected = selected[:max_k]
+    elif mode == "relative_gap":
+        min_score = aligned[0][1] - gap
+        selected = [(evid_id, score) for evid_id, score in aligned if score >= min_score]
+        selected = selected[:max_k]
+    else:
+        raise ValueError(f"Unsupported evidence selection mode: {mode}")
+
+    if not selected:
+        selected = aligned[:1]
+
+    evidences, scores = zip(*selected)
+    return list(evidences), [float(score) for score in scores]
+
 def rerank_candidates(df, coarse_dict, ce_model, evid_dict, desc="Reranking"):
     print(f"Reranking candidates for {desc}...")
     final_results = {}
@@ -278,19 +314,39 @@ def rerank_candidates(df, coarse_dict, ce_model, evid_dict, desc="Reranking"):
         cands = coarse_dict.get(cid, [])
         
         if not cands:
-            final_results[cid] = {"claim_text": claim_text, "evidences": []}
+            final_results[cid] = {
+                "claim_text": claim_text,
+                "evidences": [],
+                "scores": [],
+                "candidate_evidences": [],
+                "candidate_scores": [],
+            }
             continue
             
         pairs = [[claim_text, evid_dict[c]] for c in cands]
-        scores = ce_model.predict(pairs, show_progress_bar=False)
+        scores = ce_model.predict(
+            pairs,
+            show_progress_bar=False,
+            activation_fct=torch.nn.Sigmoid(),
+        )
+        scores = np.asarray(scores).reshape(-1)
         
         # Sort descending
         ranked_indices = np.argsort(scores)[::-1]
-        top_k_ids = [cands[i] for i in ranked_indices[:TOP_FINE]]
+        candidate_indices = ranked_indices[:RERANK_CANDIDATE_K]
+        candidate_evidences = [cands[i] for i in candidate_indices]
+        candidate_scores = [float(scores[i]) for i in candidate_indices]
+        selected_evidences, selected_scores = select_evidences(
+            candidate_evidences,
+            candidate_scores,
+        )
         
         final_results[cid] = {
             "claim_text": claim_text,
-            "evidences": top_k_ids
+            "evidences": selected_evidences,
+            "scores": selected_scores,
+            "candidate_evidences": candidate_evidences,
+            "candidate_scores": candidate_scores,
         }
     return final_results
 
@@ -306,22 +362,35 @@ def main():
     corpus_ids = df_evid["evid_id"].tolist()
     corpus_texts = df_evid["evid_text"].tolist()
     
-    # 1. SPLADE learned sparse retrieval
-    splade_cache_path = f"{splade_cache_name(SPLADE_MODEL_NAME)}_top{SPLADE_TOP_TERMS}_index.npz"
-    splade = build_or_load_splade(corpus_texts, splade_cache_path)
-    
-    # 2. Dense (BGE) via Fast Exact GPU Search
-    print("Loading BGE model...")
-    dense_model = SentenceTransformer(BGE_MODEL_NAME)
-    corpus_embs = build_or_load_dense_embs(corpus_texts, dense_model)
-    
-    # Ensure processed_data exists early for caching
+    # Ensure processed_data exists early for caching  adding the lazy loading principle
     os.makedirs("./processed_data", exist_ok=True)
     
-    # 3. Coarse Retrieval
-    coarse_train = coarse_retrieval(df_train, splade, corpus_embs, dense_model, corpus_ids, "Train", "./processed_data/coarse_train_splade.json")
-    coarse_dev = coarse_retrieval(df_dev, splade, corpus_embs, dense_model, corpus_ids, "Dev", "./processed_data/coarse_dev_splade.json")
-    coarse_test = coarse_retrieval(df_test, splade, corpus_embs, dense_model, corpus_ids, "Test", "./processed_data/coarse_test_splade.json")
+    coarse_train_cache = "./processed_data/coarse_train_splade.json"
+    coarse_dev_cache = "./processed_data/coarse_dev_splade.json"
+    coarse_test_cache = "./processed_data/coarse_test_splade.json"
+    
+    if os.path.exists(coarse_train_cache) and os.path.exists(coarse_dev_cache) and os.path.exists(coarse_test_cache):
+        print("Coarse retrieval caches found. Skipping model loading for coarse retrieval...")
+        with open(coarse_train_cache, "r", encoding="utf-8") as f:
+            coarse_train = json.load(f)
+        with open(coarse_dev_cache, "r", encoding="utf-8") as f:
+            coarse_dev = json.load(f)
+        with open(coarse_test_cache, "r", encoding="utf-8") as f:
+            coarse_test = json.load(f)
+    else:
+        # 1. SPLADE learned sparse retrieval
+        splade_cache_path = f"{splade_cache_name(SPLADE_MODEL_NAME)}_top{SPLADE_TOP_TERMS}_index.npz"
+        splade = build_or_load_splade(corpus_texts, splade_cache_path)
+        
+        # 2. Dense (BGE) via Fast Exact GPU Search
+        print("Loading BGE model...")
+        dense_model = SentenceTransformer(BGE_MODEL_NAME)
+        corpus_embs = build_or_load_dense_embs(corpus_texts, dense_model)
+        
+        # 3. Coarse Retrieval
+        coarse_train = coarse_retrieval(df_train, splade, corpus_embs, dense_model, corpus_ids, "Train", coarse_train_cache)
+        coarse_dev = coarse_retrieval(df_dev, splade, corpus_embs, dense_model, corpus_ids, "Dev", coarse_dev_cache)
+        coarse_test = coarse_retrieval(df_test, splade, corpus_embs, dense_model, corpus_ids, "Test", coarse_test_cache)
     
     # 4. CrossEncoder Training (STRICTLY ON TRAIN ONLY)
     ce_model_path = "./models/ce_trained_splade"

@@ -13,6 +13,7 @@ data/evidence.json
 test-output.zip
 *.gz
 *.npy
+*.npz
 
 # 模型、索引与大型二进制文件 (NLP 核心忽略)
 evidence_hnsw.bin

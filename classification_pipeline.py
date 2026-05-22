@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import numpy as np
 import pandas as pd
 import torch
@@ -88,6 +89,16 @@ def extract_zs_features(df, zs_pipe, cache_path=None):
     if cache_path:
         np.save(cache_path, res)
     return res
+
+def input_feature_cache_path(df, split_name):
+    fingerprint = hashlib.sha1()
+    for claim_id, text_input in zip(df["claim_id"], df["text_input"]):
+        fingerprint.update(str(claim_id).encode("utf-8"))
+        fingerprint.update(b"\0")
+        fingerprint.update(str(text_input).encode("utf-8"))
+        fingerprint.update(b"\0")
+    digest = fingerprint.hexdigest()[:12]
+    return f"processed_data/zs_{split_name}_{MODE}_{digest}.npy"
 
 def tokenize_function(examples, tokenizer):
     return tokenizer(examples["text_input"], truncation=True, max_length=512)
@@ -205,8 +216,8 @@ def main():
         df_eval_final = df_dev
         
     # 1. Zero-Shot Features
-    zs_cache_train = f"processed_data/zs_train_{MODE}.npy"
-    zs_cache_eval = f"processed_data/zs_eval_{MODE}.npy"
+    zs_cache_train = input_feature_cache_path(df_train_final, "train")
+    zs_cache_eval = input_feature_cache_path(df_eval_final, "eval")
     
     if os.path.exists(zs_cache_train) and os.path.exists(zs_cache_eval):
         print("Skipping Zero-Shot Pipeline loading since cache exists...")
